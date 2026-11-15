@@ -1,0 +1,82 @@
+name: Jaglosky fleet-ops
+description: Scan the whole fleet (many repos) → state.json in the fleet-ops repo → Apple account → Slack digest → autopilot (agent in the app repos)
+inputs:
+  fleet-token:
+    description: Token with access to the fleet repos (contents read, actions write, pull requests read) — fine-grained PAT or GitHub App
+    required: true
+  config:
+    default: fleet-ops.yml
+  dispatch:
+    description: "true = the autopilot dispatches the agent (per `autopilot` in fleet-ops.yml)"
+    default: "true"
+  webhook-url:
+    default: ""
+  asc-key-id:
+    default: ""
+  asc-issuer-id:
+    default: ""
+  asc-key-p8:
+    default: ""
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 24
+
+    - name: Install Jaglosky
+      shell: bash
+      run: |
+        echo "JAGLOSKY_BINARY_CACHE=$HOME/.jaglosky-binaries" >> "$GITHUB_ENV"
+        bash "$GITHUB_ACTION_PATH/../setup-cli.sh"
+
+    - name: Facts cache (all fleet apps)
+      uses: actions/cache@v4
+      with:
+        path: ~/.jaglosky-binaries/facts-android-*.json
+        key: jaglosky-fleet-facts-${{ github.run_id }}
+        restore-keys: jaglosky-fleet-facts-
+
+    - name: Fleet scan
+      shell: bash
+      env:
+        FLEET_TOKEN: ${{ inputs.fleet-token }}
+      run: |
+        mkdir -p reports
+        "$JAGLOSKY_ROOT/jaglosky" fleet scan --config "${{ inputs.config }}" --resolve \
+          --workdir "$RUNNER_TEMP/fleet" --out state.json \
+          ${{ inputs.dispatch == 'true' && '--dispatch' || '' }} > "reports/$(date -u +%Y-%m-%d).md"
+
+    - name: Report (PDF, plain English) — fleet + one per app
+      continue-on-error: true
+      shell: bash
+      run: '"$JAGLOSKY_ROOT/jaglosky" report --state state.json --out "reports/$(date -u +%Y-%m-%d)" > /dev/null'
+
+    - name: Apple account
+      if: inputs.asc-key-id != ''
+      continue-on-error: true
+      shell: bash
+      env:
+        JAGLOSKY_ASC_KEY_ID: ${{ inputs.asc-key-id }}
+        JAGLOSKY_ASC_ISSUER_ID: ${{ inputs.asc-issuer-id }}
+        JAGLOSKY_ASC_KEY_P8: ${{ inputs.asc-key-p8 }}
+      run: '"$JAGLOSKY_ROOT/jaglosky" accounts check . --state state.json | tee -a "$GITHUB_STEP_SUMMARY" >> "reports/$(date -u +%Y-%m-%d).md"'
+
+    - name: Slack digest
+      if: inputs.webhook-url != ''
+      continue-on-error: true
+      shell: bash
+      env:
+        SLACK_WEBHOOK_URL: ${{ inputs.webhook-url }}
+      run: '"$JAGLOSKY_ROOT/jaglosky" notify slack --state state.json'
+
+    - name: Save state.json and the report in the fleet-ops repo (source of truth)
+      shell: bash
+      run: |
+        git add state.json reports/
+        if git diff --cached --quiet; then
+          echo "no changes"
+          exit 0
+        fi
+        git -c user.name=Jaglosky -c user.email=jaglosky@localhost commit -qm "fleet: fleet state $(date -u +%Y-%m-%d)"
+        git push -q

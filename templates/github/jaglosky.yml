@@ -1,0 +1,63 @@
+# Jaglosky — store-requirements radar, fix pull requests and verification for this app.
+# This file only holds the triggers and your secrets; the jobs live in the Jaglosky distribution
+# (https://github.com/jaglosky/jaglosky), pinned to a major version, so fixes arrive without changing this file.
+# Everything runs on your runners. Secrets you have not set are simply empty: the radar needs none of them.
+name: Jaglosky
+
+on:
+  schedule:
+    - cron: "0 6 * * 1,4"   # radar: Mon and Thu at 06:00 UTC
+  issues:
+    types: [opened]          # "Jaglosky: <command>" issues from the Slack buttons
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "agent = the agent makes the change and opens a PR; verify = verify this branch against base; scan = radar (scan + report)"
+        type: choice
+        options: [agent, verify, scan]
+        default: agent
+      task:
+        description: Agent task (agent mode)
+        default: target-sdk-36
+      base:
+        description: Base branch for verify mode (empty = the default branch)
+        default: ""
+      ios:
+        description: "Verify iOS on a macOS runner (opt-in, macOS minutes cost ×10)"
+        type: boolean
+        default: false
+      autopilot:
+        description: "scan mode: also dispatch the agent for every finding it can fix (the \"Fix all\" button)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write        # push jaglosky/* and jaglosky-artifacts branches
+  pull-requests: write   # PR + evidence comment
+  statuses: write        # jaglosky/smoke-android status on the PR commit
+  actions: write         # download the APK from an earlier run and let the autopilot dispatch the agent
+  issues: write          # answer and close "Jaglosky: <command>" issues
+
+jobs:
+  jaglosky:
+    if: github.event_name != 'issues' || startsWith(github.event.issue.title, 'Jaglosky:')
+    uses: jaglosky/jaglosky/.github/workflows/jaglosky.yml@v1
+    with:
+      mode: ${{ inputs.mode || '' }}
+      task: ${{ inputs.task || '' }}
+      base: ${{ inputs.base || '' }}
+      ios: ${{ inputs.ios || false }}
+      autopilot: ${{ inputs.autopilot || false }}
+      app-name: ""          # name in notifications (empty = repo name)
+      android-package: ""   # applicationId for the smoke test (empty = read from the APK)
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}                 # fix pull requests (the agent)
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}                 # digests and PR messages
+      JAGLOSKY_APP_ID: ${{ secrets.JAGLOSKY_APP_ID }}                     # your Jaglosky GitHub App (`jaglosky init`)
+      JAGLOSKY_APP_PRIVATE_KEY: ${{ secrets.JAGLOSKY_APP_PRIVATE_KEY }}
+      JAGLOSKY_APP_ENV: ${{ secrets.JAGLOSKY_APP_ENV }}                   # the app's EXPO_PUBLIC_* config for CI builds
+      JAGLOSKY_PUSH_TOKEN: ${{ secrets.JAGLOSKY_PUSH_TOKEN }}             # only without the GitHub App
+      JAGLOSKY_LICENSE_KEY: ${{ secrets.JAGLOSKY_LICENSE_KEY }}
+      JAGLOSKY_ASC_KEY_ID: ${{ secrets.JAGLOSKY_ASC_KEY_ID }}             # optional: App Store Connect checks
+      JAGLOSKY_ASC_ISSUER_ID: ${{ secrets.JAGLOSKY_ASC_ISSUER_ID }}
+      JAGLOSKY_ASC_KEY_P8: ${{ secrets.JAGLOSKY_ASC_KEY_P8 }}

@@ -1,0 +1,109 @@
+name: Jaglosky smoke (iOS)
+description: macOS runner → simulator build (Expo CNG / React Native / native Xcode project / Flutter) → launch on an iPhone simulator → crash gate → screenshots in the PR
+inputs:
+  app-env:
+    description: (optional) the app's .env as KEY=value lines (secret JAGLOSKY_APP_ENV) — only EXPO_PUBLIC_* lines reach the build
+    default: ""
+  out-dir:
+    default: jaglosky-smoke-ios
+  pr-number:
+    description: If set, screenshots and the result go to a PR comment + the jaglosky/smoke-ios status
+    default: ""
+  evidence:
+    description: "true = publish screenshots even without a PR (run summary + jaglosky-artifacts branch), e.g. release-check"
+    default: "false"
+  github-token:
+    default: ""
+  xcode:
+    description: "Xcode version for the build (e.g. 16.4); empty = the newest on the runner"
+    default: ""
+outputs:
+  result:
+    description: pass | fail | inconclusive (the app needs its configuration in CI)
+    value: ${{ steps.result.outputs.result }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 24
+
+    - name: App configuration (EXPO_PUBLIC_* from JAGLOSKY_APP_ENV)
+      if: inputs.app-env != ''
+      shell: bash
+      env:
+        APP_ENV: ${{ inputs.app-env }}
+      run: bash "$GITHUB_ACTION_PATH/../app-env.sh"
+
+    - name: App dependencies
+      shell: bash
+      run: bash "$GITHUB_ACTION_PATH/../install-deps.sh"
+
+    - name: Flutter SDK (Flutter apps only)
+      if: hashFiles('pubspec.yaml') != ''
+      uses: subosito/flutter-action@v2
+      with:
+        channel: stable
+        cache: true
+
+    - name: Cache CocoaPods
+      uses: actions/cache@v4
+      with:
+        path: ~/Library/Caches/CocoaPods
+        key: jaglosky-pods-${{ runner.os }}-${{ hashFiles('package-lock.json', 'yarn.lock', 'pnpm-lock.yaml') }}
+        restore-keys: jaglosky-pods-${{ runner.os }}-
+
+    - name: iOS build (simulator)
+      shell: bash
+      env:
+        JAGLOSKY_XCODE: ${{ inputs.xcode }}
+      run: bash "${{ github.action_path }}/build.sh" "${{ inputs.out-dir }}"
+
+    # The built simulator app in the IPA layout (Payload/<App>.app): input for the guideline checks
+    # (privacy manifests, required-reason APIs, purpose strings) and for "try it yourself" links.
+    - name: Keep the simulator app
+      if: hashFiles(format('{0}/app-path.txt', inputs.out-dir)) != ''
+      shell: bash
+      run: |
+        OUT="$PWD/${{ inputs.out-dir }}"; APP="$(cat "$OUT/app-path.txt")"; TMP="$(mktemp -d)"
+        mkdir "$TMP/Payload" && cp -R "$APP" "$TMP/Payload/" && (cd "$TMP" && zip -qry "$OUT/app-simulator.zip" Payload)
+        echo "📦 $(basename "$APP") → app-simulator.zip ($(du -h "$OUT/app-simulator.zip" | cut -f1))"
+        # Facts for the App Store upload-validation checks (privacy manifests, required-reason APIs, purpose strings).
+        python3 -I "${{ github.action_path }}/ios-facts.py" "$APP" "${{ github.action_path }}/../../../packages/cli/src/guidelines/ios-symbols.json" "$OUT/ios-facts.json" \
+          || echo "⚠️  iOS facts not collected — the guideline checks will be skipped"
+
+    - name: Smoke test on the simulator
+      shell: bash
+      run: |
+        if [ "$(cat "${{ inputs.out-dir }}/build-result.txt" 2>/dev/null)" = "ok" ]; then
+          bash "${{ github.action_path }}/smoke.sh" "$(cat "${{ inputs.out-dir }}/app-path.txt")" "${{ inputs.out-dir }}"
+        else
+          echo fail > "${{ inputs.out-dir }}/result.txt"
+        fi
+
+    - name: Result
+      id: result
+      shell: bash
+      run: |
+        RESULT="$(cat "${{ inputs.out-dir }}/result.txt" 2>/dev/null || echo fail)"
+        echo "result=$RESULT" >> "$GITHUB_OUTPUT"
+        {
+          echo "### Jaglosky smoke (iOS): $RESULT"
+          [ -f "${{ inputs.out-dir }}/notes.txt" ] && sed 's/^/- /' "${{ inputs.out-dir }}/notes.txt"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Evidence (PR comment or run summary)
+      if: inputs.pr-number != '' || inputs.evidence == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        bash "${{ github.action_path }}/../smoke-android/publish.sh" "${{ inputs.pr-number }}" "${{ inputs.out-dir }}" \
+          "${{ steps.result.outputs.result }}" "iOS (simulator)" "jaglosky/smoke-ios"
+
+    - name: Gate
+      if: steps.result.outputs.result != 'pass' && steps.result.outputs.result != 'inconclusive'
+      shell: bash
+      run: |
+        echo "iOS smoke test failed — details in the run artifacts and the PR comment."
+        exit 1

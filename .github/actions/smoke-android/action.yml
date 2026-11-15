@@ -1,0 +1,70 @@
+name: Jaglosky smoke (Android)
+description: Android emulator → install APK → launch, back gesture, rotation → logcat crash gate → screenshots in the PR
+inputs:
+  apk:
+    description: Path to the APK, or a directory with exactly one APK (e.g. the downloaded jaglosky-run artifact)
+    required: true
+  package:
+    description: The app's applicationId (e.g. com.acme.app); empty = read from the APK
+    default: ""
+  api-level:
+    default: "36"
+  out-dir:
+    default: jaglosky-smoke
+  pr-number:
+    description: If set, screenshots and the result go to a PR comment + a commit status
+    default: ""
+  evidence:
+    description: "true = publish screenshots even without a PR (run summary + jaglosky-artifacts branch), e.g. release-check"
+    default: "false"
+  github-token:
+    default: ""
+outputs:
+  result:
+    description: pass | fail | inconclusive (the app needs its configuration in CI)
+    value: ${{ steps.result.outputs.result }}
+runs:
+  using: composite
+  steps:
+    - name: KVM for the emulator
+      shell: bash
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm
+
+    - name: Emulator + smoke test
+      uses: reactivecircus/android-emulator-runner@v2
+      with:
+        api-level: ${{ inputs.api-level }}
+        target: google_apis
+        arch: x86_64
+        profile: pixel_6
+        disable-animations: true
+        emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-snapshot-save -memory 3072
+        script: bash "${{ github.action_path }}/smoke.sh" "${{ inputs.apk }}" "${{ inputs.package }}" "${{ inputs.out-dir }}"
+
+    - name: Result
+      id: result
+      shell: bash
+      run: |
+        RESULT="$(cat "${{ inputs.out-dir }}/result.txt" 2>/dev/null || echo fail)"
+        echo "result=$RESULT" >> "$GITHUB_OUTPUT"
+        {
+          echo "### Jaglosky smoke (Android ${{ inputs.api-level }}): $RESULT"
+          [ -f "${{ inputs.out-dir }}/notes.txt" ] && sed 's/^/- /' "${{ inputs.out-dir }}/notes.txt"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Evidence (screenshots on the jaglosky-artifacts branch + PR comment or run summary + status)
+      if: inputs.pr-number != '' || inputs.evidence == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: bash "${{ github.action_path }}/publish.sh" "${{ inputs.pr-number }}" "${{ inputs.out-dir }}" "${{ steps.result.outputs.result }}" "Android ${{ inputs.api-level }} (emulator)" "jaglosky/smoke-android"
+
+    - name: Gate
+      if: steps.result.outputs.result != 'pass' && steps.result.outputs.result != 'inconclusive'
+      shell: bash
+      run: |
+        echo "Smoke test failed — details in the run artifacts and the PR comment."
+        exit 1

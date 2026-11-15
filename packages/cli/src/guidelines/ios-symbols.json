@@ -1,0 +1,48 @@
+{
+  "verified": "2026-11-12",
+  "_comment": "Symbols Apple's upload validation looks for in the app binary. Shared by the collector (.github/actions/smoke-ios/ios-facts.py, macOS) and the analysis (ios.ts). Checked on 2026-11-12 against Apple's pages: required_reason = the API lists in developer.apple.com/documentation/bundleresources/app-privacy-configuration/nsprivacyaccessedapitypes/nsprivacyaccessedapitype (5 categories; getattrlist / fgetattrlist / getattrlistat are listed under both file timestamps and disk space); purpose keys = all present in …/bundleresources/protected-resources; listed_sdks = the 86 entries of developer.apple.com/support/third-party-SDK-requirements (watched: source apple-third-party-sdks; 'BoringSSL / openssl_grpc' is kept under its pod and framework names). Not checked: the mapping from an API to its binary symbol (from nm output of real apps), and how strictly App Store Connect enforces each item.",
+  "required_reason": {
+    "NSPrivacyAccessedAPICategoryFileTimestamp": {
+      "symbols": ["_stat", "_fstat", "_fstatat", "_lstat", "_getattrlist", "_getattrlistbulk", "_fgetattrlist", "_getattrlistat",
+                  "_NSFileCreationDate", "_NSFileModificationDate", "_NSURLContentModificationDateKey", "_NSURLCreationDateKey"],
+      "selectors": ["fileModificationDate"]
+    },
+    "NSPrivacyAccessedAPICategorySystemBootTime": { "symbols": ["_mach_absolute_time"], "selectors": ["systemUptime"] },
+    "NSPrivacyAccessedAPICategoryDiskSpace": {
+      "symbols": ["_statfs", "_statvfs", "_fstatfs", "_fstatvfs", "_NSURLVolumeAvailableCapacityKey",
+                  "_NSURLVolumeAvailableCapacityForImportantUsageKey", "_NSURLVolumeAvailableCapacityForOpportunisticUsageKey",
+                  "_NSURLVolumeTotalCapacityKey", "_NSFileSystemFreeSize", "_NSFileSystemSize", "_getattrlist", "_fgetattrlist", "_getattrlistat"],
+      "selectors": []
+    },
+    "NSPrivacyAccessedAPICategoryActiveKeyboards": { "symbols": [], "selectors": ["activeInputModes"] },
+    "NSPrivacyAccessedAPICategoryUserDefaults": { "symbols": ["_OBJC_CLASS_$_NSUserDefaults"], "selectors": [] }
+  },
+  "purpose": [
+    { "api": "camera (AVCaptureDevice)", "symbols": ["_OBJC_CLASS_$_AVCaptureDevice"], "selectors": [], "keys": ["NSCameraUsageDescription"] },
+    { "api": "microphone (record permission)", "symbols": [], "selectors": ["requestRecordPermission:", "requestRecordPermissionWithCompletionHandler:"], "keys": ["NSMicrophoneUsageDescription"] },
+    { "api": "photo library (PHPhotoLibrary)", "symbols": ["_OBJC_CLASS_$_PHPhotoLibrary"], "selectors": [], "keys": ["NSPhotoLibraryUsageDescription", "NSPhotoLibraryAddUsageDescription"] },
+    { "api": "location (CLLocationManager)", "symbols": ["_OBJC_CLASS_$_CLLocationManager"], "selectors": [], "keys": ["NSLocationWhenInUseUsageDescription", "NSLocationAlwaysAndWhenInUseUsageDescription"] },
+    { "api": "contacts (CNContactStore)", "symbols": ["_OBJC_CLASS_$_CNContactStore"], "selectors": [], "keys": ["NSContactsUsageDescription"] },
+    { "api": "calendar / reminders (EKEventStore)", "symbols": ["_OBJC_CLASS_$_EKEventStore"], "selectors": [], "keys": ["NSCalendarsUsageDescription", "NSCalendarsFullAccessUsageDescription", "NSCalendarsWriteOnlyAccessUsageDescription", "NSRemindersUsageDescription", "NSRemindersFullAccessUsageDescription"] },
+    { "api": "Bluetooth (CBCentralManager)", "symbols": ["_OBJC_CLASS_$_CBCentralManager"], "selectors": [], "keys": ["NSBluetoothAlwaysUsageDescription"] },
+    { "api": "Face ID (LAContext)", "symbols": ["_OBJC_CLASS_$_LAContext"], "selectors": [], "keys": ["NSFaceIDUsageDescription"] },
+    { "api": "motion (CMMotionActivityManager)", "symbols": ["_OBJC_CLASS_$_CMMotionActivityManager"], "selectors": [], "keys": ["NSMotionUsageDescription"] },
+    { "api": "speech recognition (SFSpeechRecognizer)", "symbols": ["_OBJC_CLASS_$_SFSpeechRecognizer"], "selectors": [], "keys": ["NSSpeechRecognitionUsageDescription"] },
+    { "api": "HealthKit (HKHealthStore)", "symbols": ["_OBJC_CLASS_$_HKHealthStore"], "selectors": [], "keys": ["NSHealthShareUsageDescription", "NSHealthUpdateUsageDescription"] },
+    { "api": "tracking (ATTrackingManager)", "symbols": ["_OBJC_CLASS_$_ATTrackingManager"], "selectors": [], "keys": ["NSUserTrackingUsageDescription"] },
+    { "api": "media library (MPMediaLibrary)", "symbols": ["_OBJC_CLASS_$_MPMediaLibrary"], "selectors": [], "keys": ["NSAppleMusicUsageDescription"] }
+  ],
+  "idfa": "_OBJC_CLASS_$_ASIdentifierManager",
+  "att": "_OBJC_CLASS_$_ATTrackingManager",
+  "listed_sdks": ["Abseil", "AFNetworking", "Alamofire", "AppAuth", "BoringSSL", "BoringSSL-GRPC", "openssl_grpc", "Capacitor", "Charts", "connectivity_plus",
+    "Cordova", "device_info_plus", "DKImagePickerController", "DKPhotoGallery", "FBAEMKit", "FBLPromises", "FBSDKCoreKit", "FBSDKCoreKit_Basics",
+    "FBSDKLoginKit", "FBSDKShareKit", "file_picker", "FirebaseABTesting", "FirebaseAuth", "FirebaseCore", "FirebaseCoreDiagnostics",
+    "FirebaseCoreExtension", "FirebaseCoreInternal", "FirebaseCrashlytics", "FirebaseDynamicLinks", "FirebaseFirestore", "FirebaseInstallations",
+    "FirebaseMessaging", "FirebaseRemoteConfig", "Flutter", "flutter_inappwebview", "flutter_local_notifications", "fluttertoast", "FMDB", "geolocator_apple", "GoogleDataTransport", "GoogleSignIn",
+    "GoogleToolboxForMac", "GoogleUtilities", "grpcpp", "GTMAppAuth", "GTMSessionFetcher", "hermes", "image_picker_ios", "IQKeyboardManager",
+    "IQKeyboardManagerSwift", "Kingfisher", "leveldb", "Lottie", "MBProgressHUD", "nanopb", "OneSignal", "OneSignalCore", "OneSignalExtension",
+    "OneSignalOutcomes", "OpenSSL", "OrderedSet", "package_info", "package_info_plus", "path_provider", "path_provider_ios", "Promises",
+    "Protobuf", "Reachability", "RealmSwift", "RxCocoa", "RxRelay", "RxSwift", "SDWebImage", "share_plus", "shared_preferences_ios", "SnapKit",
+    "sqflite", "Starscream", "SVProgressHUD", "SwiftyGif", "SwiftyJSON", "Toast", "UnityFramework", "url_launcher", "url_launcher_ios",
+    "video_player_avfoundation", "wakelock", "webview_flutter_wkwebview"]
+}

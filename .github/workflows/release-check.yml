@@ -1,0 +1,199 @@
+# Jaglosky release check — the jobs behind a client's `Jaglosky release check` workflow: store rules, a release
+# build (or the client's own APK / AAB), emulator and simulator smoke tests, store guideline checks → one verdict.
+# Called from templates/github/jaglosky-release-check.yml in the app repo:
+#   jobs:
+#     release-check:
+#       uses: jaglosky/jaglosky/.github/workflows/release-check.yml@v1
+# The job fails on NO-GO, so the caller can use it as a gate (`needs: release-check`).
+name: Jaglosky release check
+
+on:
+  workflow_call:
+    inputs:
+      ios:
+        description: Check iOS on a macOS runner (always on for tag pushes)
+        type: boolean
+        default: true
+      binary-url:
+        description: "(optional) Test this APK/AAB instead of building one — a direct https link"
+        type: string
+        default: ""
+      xcode:
+        description: "(optional) Xcode for the iOS build, e.g. 16.4 (default: newest)"
+        type: string
+        default: ""
+    secrets:
+      SLACK_WEBHOOK_URL:
+        description: "Slack incoming webhook for digests, PR and verdict messages"
+        required: false
+      JAGLOSKY_APP_ENV:
+        description: "the app's EXPO_PUBLIC_* configuration for CI builds (one KEY=value per line)"
+        required: false
+      JAGLOSKY_LICENSE_KEY:
+        description: "rules feed and usage metering"
+        required: false
+      JAGLOSKY_ASC_KEY_ID:
+        description: "App Store Connect API key id (account checks, version vs store)"
+        required: false
+      JAGLOSKY_ASC_ISSUER_ID:
+        description: "App Store Connect issuer id"
+        required: false
+      JAGLOSKY_ASC_KEY_P8:
+        description: "App Store Connect private key"
+        required: false
+      JAGLOSKY_PLAY_SA_JSON:
+        description: "Google Play service account JSON (version vs store)"
+        required: false
+
+env:
+  JAGLOSKY_LICENSE_KEY: ${{ secrets.JAGLOSKY_LICENSE_KEY }}   # rules feed + usage metering (from `jaglosky init`)
+  JAGLOSKY_API: ${{ vars.JAGLOSKY_API }}                      # empty = no Jaglosky service: bundled rules, no metering
+
+concurrency:
+  group: jaglosky-release-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      outcome: ${{ steps.check.outputs.outcome }}
+      has-android: ${{ steps.check.outputs.has-android }}
+      has-ios: ${{ steps.check.outputs.has-ios }}
+      binary: ${{ steps.check.outputs.binary }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+      - id: check
+        uses: jaglosky/jaglosky/.github/actions/agent@v1
+        with:
+          app-env: ${{ secrets.JAGLOSKY_APP_ENV }}   # optional: the app's EXPO_PUBLIC_* config for CI builds
+          mode: release-check
+          binary-url: ${{ inputs.binary-url }}
+          ios: ${{ github.event_name == 'push' || inputs.ios }}
+          github-token: ${{ github.token }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jaglosky-release
+          path: ${{ steps.check.outputs.release-dir || 'jaglosky-no-release' }}
+          if-no-files-found: ignore
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jaglosky-run
+          path: ${{ steps.check.outputs.run-dir || 'jaglosky-no-run' }}
+          if-no-files-found: ignore
+          retention-days: 14
+
+  android:
+    needs: check
+    if: needs.check.outputs.has-android == 'true' && needs.check.outputs.outcome == 'green'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: jaglosky-run
+          path: jaglosky-run
+      - uses: jaglosky/jaglosky/.github/actions/smoke-android@v1
+        with:
+          apk: jaglosky-run
+          evidence: "true"
+          github-token: ${{ github.token }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jaglosky-smoke
+          path: jaglosky-smoke
+          if-no-files-found: ignore
+          retention-days: 30
+
+  ios:
+    needs: check
+    if: always() && needs.check.outputs.has-ios == 'true' && (github.event_name == 'push' || inputs.ios)
+    runs-on: ${{ startsWith(inputs.xcode, '16') && 'macos-15' || 'macos-latest' }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jaglosky/jaglosky/.github/actions/smoke-ios@v1
+        with:
+          app-env: ${{ secrets.JAGLOSKY_APP_ENV }}
+          evidence: "true"
+          github-token: ${{ github.token }}
+          xcode: ${{ inputs.xcode }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jaglosky-smoke-ios
+          path: jaglosky-smoke-ios
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # No Apple-silicon runner ("not acquired … after multiple attempts") → same job on the Intel image.
+  ios-intel:
+    needs: [check, ios]
+    if: ${{ !cancelled() && needs.ios.result == 'cancelled' }}
+    runs-on: ${{ startsWith(inputs.xcode, '16') && 'macos-15-intel' || 'macos-26-intel' }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jaglosky/jaglosky/.github/actions/smoke-ios@v1
+        with:
+          app-env: ${{ secrets.JAGLOSKY_APP_ENV }}
+          evidence: "true"
+          github-token: ${{ github.token }}
+          xcode: ${{ inputs.xcode }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jaglosky-smoke-ios
+          path: jaglosky-smoke-ios
+          if-no-files-found: ignore
+          retention-days: 30
+
+  verdict:
+    needs: [check, android, ios, ios-intel]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4   # eas.json (who assigns build numbers)
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: jaglosky-release
+          path: jaglosky-release
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: jaglosky-run
+          path: jaglosky-run
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: jaglosky-smoke
+          path: jaglosky-smoke
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: jaglosky-smoke-ios
+          path: jaglosky-smoke-ios
+      - uses: jaglosky/jaglosky/.github/actions/release-verdict@v1
+        with:
+          ref: ${{ github.ref_name }}
+          ios: ${{ (github.event_name == 'push' || inputs.ios) && 'true' || 'false' }}
+          binary: ${{ needs.check.outputs.binary }}
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          # Optional — compare the release version with the stores (without them: public App Store lookup only).
+          asc-key-id: ${{ secrets.JAGLOSKY_ASC_KEY_ID }}
+          asc-issuer-id: ${{ secrets.JAGLOSKY_ASC_ISSUER_ID }}
+          asc-key-p8: ${{ secrets.JAGLOSKY_ASC_KEY_P8 }}
+          play-service-account: ${{ secrets.JAGLOSKY_PLAY_SA_JSON }}

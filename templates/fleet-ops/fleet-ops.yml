@@ -1,0 +1,14 @@
+# fleet-ops.yml — the list of apps in the agency's fleet (docs/HANDOFF.md, section 3).
+# Every app repo has its own Jaglosky workflow (templates/github/jaglosky.yml) — fleet-ops dispatches it.
+version: 1
+owner: your-github-org
+workflow: Jaglosky
+autopilot: false          # true = the radar dispatches the agent itself for "→ agent" findings (L1: the agent opens a PR)
+apple:
+  membership_renewal: 2027-03-01   # Apple has no API for the membership date — enter it manually
+repos:
+  - name: your-app-repo
+    ios: false
+  # - name: another-app
+  # - name: another-org/client-app
+  #   autopilot: false

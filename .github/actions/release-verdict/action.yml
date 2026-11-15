@@ -1,0 +1,102 @@
+name: Jaglosky release check — verdict
+description: Store rules + release build + emulator/simulator smoke tests → one go / no-go (run summary, Slack, optional gate)
+inputs:
+  ref:
+    description: Release candidate (branch or tag)
+    required: true
+  release-dir:
+    description: Directory with state.json from the release-check scan
+    default: jaglosky-release
+  run-dir:
+    description: Directory with verify.json from the release build (absent when the client supplied the binary)
+    default: jaglosky-run
+  smoke-dir:
+    default: jaglosky-smoke
+  ios-smoke-dir:
+    default: jaglosky-smoke-ios
+  ios:
+    description: "true = the iOS job was enabled for this check"
+    default: "false"
+  binary:
+    description: What was tested when the client supplied the binary, e.g. "client-supplied AAB"
+    default: ""
+  webhook-url:
+    description: Slack Incoming Webhook (empty = no Slack)
+    default: ""
+  gate:
+    description: "true = fail this job on NO-GO (use as a gate in a release workflow)"
+    default: "true"
+  store-countries:
+    description: Countries for the public App Store version lookup (comma-separated)
+    default: "us,pl,gb,de,fr,es,it,nl"
+  asc-key-id:
+    description: (optional) App Store Connect API key — versions and build numbers incl. TestFlight / in review
+    default: ""
+  asc-issuer-id:
+    default: ""
+  asc-key-p8:
+    default: ""
+  play-service-account:
+    description: (optional) Google Play service account JSON — version codes on all tracks
+    default: ""
+outputs:
+  verdict:
+    description: go | warn | no-go
+    value: ${{ steps.verdict.outputs.verdict }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 24
+
+    - name: Install Jaglosky
+      shell: bash
+      run: |
+        bash "$GITHUB_ACTION_PATH/../setup-cli.sh"
+
+    - name: Verdict
+      id: verdict
+      shell: bash
+      env:
+        JAGLOSKY_ASC_KEY_ID: ${{ inputs.asc-key-id }}
+        JAGLOSKY_ASC_ISSUER_ID: ${{ inputs.asc-issuer-id }}
+        JAGLOSKY_ASC_KEY_P8: ${{ inputs.asc-key-p8 }}
+        JAGLOSKY_PLAY_SA_JSON: ${{ inputs.play-service-account }}
+      run: |
+        if [ ! -f "${{ inputs.release-dir }}/state.json" ]; then
+          echo "::error::No state.json from the release-check scan — the check job did not finish."
+          echo "verdict=no-go" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        "$JAGLOSKY_ROOT/jaglosky" release-check \
+          --state "${{ inputs.release-dir }}/state.json" \
+          --ref "${{ inputs.ref }}" \
+          --run-dir "${{ inputs.run-dir }}" \
+          --smoke-dir "${{ inputs.smoke-dir }}" \
+          --ios-smoke-dir "${{ inputs.ios-smoke-dir }}" \
+          ${{ inputs.ios == 'true' && '--ios' || '' }} \
+          ${{ inputs.binary != '' && format('--binary "{0}"', inputs.binary) || '' }} \
+          --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+          --repo "$GITHUB_WORKSPACE" \
+          --store-countries "${{ inputs.store-countries }}" \
+          --out jaglosky-release-check > /dev/null
+        cat jaglosky-release-check/verdict.md >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Slack
+      if: inputs.webhook-url != ''
+      continue-on-error: true
+      shell: bash
+      env:
+        SLACK_WEBHOOK_URL: ${{ inputs.webhook-url }}
+      run: |
+        [ -f jaglosky-release-check/verdict.json ] || exit 0
+        "$JAGLOSKY_ROOT/jaglosky" notify slack --verdict jaglosky-release-check/verdict.json \
+          --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+    - name: Gate
+      if: inputs.gate == 'true' && steps.verdict.outputs.verdict == 'no-go'
+      shell: bash
+      run: |
+        echo "Jaglosky release check: NO-GO — see the run summary for the reasons and screenshots."
+        exit 1

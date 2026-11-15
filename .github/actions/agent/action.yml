@@ -1,0 +1,276 @@
+name: Jaglosky agent
+description: Scan → agent (Claude Agent SDK, BYOK) → verification plan (fingerprint) → build or repack → branch jaglosky/<rule> → PR
+inputs:
+  app-env:
+    description: (optional) the app's .env as KEY=value lines (secret JAGLOSKY_APP_ENV) — only EXPO_PUBLIC_* lines reach the build
+    default: ""
+  mode:
+    description: >-
+      agent = the agent makes the change and opens a PR; verify = only verify HEAD against `base` (e.g. a human's
+      commit in a PR); release-check = store scan + full release build of HEAD (or the client's binary-url)
+    default: agent
+  binary-url:
+    description: (release-check) test this APK/AAB (https URL, e.g. from EAS or your CI) instead of building one
+    default: ""
+  base:
+    description: (verify) base ref to compare fingerprints against
+    default: main
+  seed-run-id:
+    description: (optional) ID of a run whose APK (jaglosky-run artifact) seeds the binary cache
+    default: ""
+  task:
+    description: Agent task (e.g. target-sdk-36)
+    default: target-sdk-36
+  anthropic-api-key:
+    description: The client's Anthropic key (from repo secrets; not needed in verify mode)
+    default: ""
+  github-token:
+    description: Token for pushing branches, PRs and downloading artifacts (github.token)
+    required: true
+  push-token:
+    description: >-
+      (optional) Token used only to push the agent's branch. Needed when the change touches
+      .github/workflows (e.g. the ci-xcode-26 task): GITHUB_TOKEN cannot push workflow files.
+      Fine-grained PAT or GitHub App token with Contents + Workflows write on this repo.
+    default: ""
+  max-turns:
+    default: "60"
+  retries:
+    description: How many times the agent gets a red build log to fix
+    default: "1"
+  android-variant:
+    description: release = APK with the JS bundle for the emulator smoke test
+    default: release
+  model:
+    description: Agent model (empty = Jaglosky default)
+    default: ""
+  android-abis:
+    description: Native architectures to build (CI emulator = x86_64; empty = all)
+    default: x86_64
+  ios:
+    description: "true = iOS is verified in a separate job on a macOS runner (opt-in, macOS minutes are expensive)"
+    default: "false"
+outputs:
+  outcome:
+    description: green | red_build | not_fixed | policy_violation | no_changes | agent_error | infra_error | skipped
+    value: ${{ steps.run.outputs.outcome }}
+  release-dir:
+    description: (release-check) directory with state.json + report.md of the release candidate
+    value: ${{ steps.run.outputs.release-dir }}
+  has-android:
+    value: ${{ steps.run.outputs.has-android }}
+  has-ios:
+    value: ${{ steps.run.outputs.has-ios }}
+  binary:
+    description: (release-check) what is being tested when the client supplied it, e.g. "client-supplied AAB"
+    value: ${{ steps.run.outputs.binary }}
+  branch:
+    value: ${{ steps.run.outputs.branch }}
+  run-dir:
+    value: ${{ steps.run.outputs.run-dir }}
+  apk:
+    value: ${{ steps.run.outputs.apk }}
+  cost-usd:
+    value: ${{ steps.run.outputs.cost-usd }}
+  ios-strategy:
+    description: build | repack | skip | unsupported — what to do with iOS (fingerprint-based plan)
+    value: ${{ steps.run.outputs.ios-strategy }}
+  pr-number:
+    value: ${{ steps.pr.outputs.number || steps.prlookup.outputs.number }}
+  pr-url:
+    value: ${{ steps.pr.outputs.url || steps.prlookup.outputs.url }}
+runs:
+  using: composite
+  steps:
+    - name: Prepare the runner (disk, swap)
+      shell: bash
+      run: |
+        echo "CPU: $(nproc)"; free -h; df -h / | tail -1
+        # Tools preinstalled by GitHub that an RN build doesn't need (the Android SDK stays).
+        sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost \
+          /opt/hostedtoolcache/CodeQL /usr/local/share/powershell /usr/share/swift /opt/microsoft || true
+        sudo docker image prune --all --force > /dev/null 2>&1 || true
+        # Swap: the memory peak (Gradle + R8 + Metro) should slow the build down, not kill the runner.
+        sudo swapoff -a || true
+        sudo fallocate -l 8G /mnt/jaglosky.swap 2>/dev/null || sudo fallocate -l 8G /jaglosky.swap
+        SWAP=$( [ -f /mnt/jaglosky.swap ] && echo /mnt/jaglosky.swap || echo /jaglosky.swap )
+        sudo chmod 600 "$SWAP" && sudo mkswap -q "$SWAP" && sudo swapon "$SWAP"
+        free -h; df -h / | tail -1
+        echo "JAGLOSKY_BINARY_CACHE=$HOME/.jaglosky-binaries" >> "$GITHUB_ENV"
+
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 24
+
+    - name: Install Jaglosky
+      shell: bash
+      run: |
+        bash "$GITHUB_ACTION_PATH/../setup-cli.sh" --agent
+
+    - name: App configuration (EXPO_PUBLIC_* from JAGLOSKY_APP_ENV)
+      if: inputs.app-env != ''
+      shell: bash
+      env:
+        APP_ENV: ${{ inputs.app-env }}
+      run: bash "$GITHUB_ACTION_PATH/../app-env.sh"
+
+    - name: App dependencies
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        bash "$GITHUB_ACTION_PATH/../install-deps.sh"
+
+    # --- Fingerprint-keyed cache: binaries for repack + Gradle facts (no 7-min prebuild) ---
+    - name: Native fingerprint
+      id: fp
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: '"$JAGLOSKY_ROOT/jaglosky" fingerprint "$GITHUB_WORKSPACE" > /dev/null || echo "android=" >> "$GITHUB_OUTPUT"'
+
+    - name: Gradle facts cache (restore)
+      id: facts
+      if: steps.fp.outputs.android != ''
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/.jaglosky-binaries/facts-android-*.json
+        key: jaglosky-facts-android-${{ steps.fp.outputs.android }}
+
+    - name: Binary cache (restore)
+      if: steps.fp.outputs.android != ''
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/.jaglosky-binaries/android-*.apk
+        key: jaglosky-bin-android-${{ steps.fp.outputs.android }}
+
+    - name: Seed the cache with an APK from an earlier run
+      if: inputs.seed-run-id != '' && steps.fp.outputs.android != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        mkdir -p "$JAGLOSKY_BINARY_CACHE" /tmp/jaglosky-seed
+        TARGET="$JAGLOSKY_BINARY_CACHE/android-${{ steps.fp.outputs.android }}.apk"
+        if [ -f "$TARGET" ]; then
+          echo "binary already cached"
+          exit 0
+        fi
+        gh run download "${{ inputs.seed-run-id }}" -R "$GITHUB_REPOSITORY" -n jaglosky-run -D /tmp/jaglosky-seed
+        cp "$(ls /tmp/jaglosky-seed/*.apk | head -1)" "$TARGET"
+        echo "seed: APK from run ${{ inputs.seed-run-id }} → $TARGET"
+
+    - name: Flutter SDK (Flutter apps only)
+      if: hashFiles('pubspec.yaml') != ''
+      uses: subosito/flutter-action@v2
+      with:
+        channel: stable
+        cache: true
+
+    - name: Agent or verification
+      id: run
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        JAGLOSKY_AGENT_MODEL: ${{ inputs.model }}
+        JAGLOSKY_IOS: ${{ inputs.ios == 'true' && 'delegate' || '' }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        # Metro (JS bundle in release) inherits NODE_OPTIONS — keep it low next to Gradle.
+        NODE_OPTIONS: --max-old-space-size=2560
+        # Build settings owned by the orchestrator (not the app's code). Weak runner (~7 GB RAM):
+        # Gradle 3 GB, Kotlin in the Gradle process, 2 workers, Gradle build cache (saved by setup-gradle).
+        JAGLOSKY_ANDROID_ABIS: ${{ inputs.android-abis }}
+        JAGLOSKY_GRADLE_JVMARGS: -Xmx3g -XX:MaxMetaspaceSize=768m
+        JAGLOSKY_GRADLE_EXTRA_ARGS: --build-cache -Pkotlin.compiler.execution.strategy=in-process -Dorg.gradle.workers.max=2
+      run: |
+        # Memory monitor in the log (every 60 s) — diagnostics in case the runner dies again.
+        ( while true; do echo "[mem $(date -u +%H:%M:%S)] $(free -m | awk 'NR==2{printf "RAM %s/%s MB", $3, $2} NR==3{printf ", swap %s/%s MB", $3, $2}')"; sleep 60; done ) &
+        MEMWATCH=$!
+        trap 'kill $MEMWATCH 2>/dev/null || true' EXIT
+        START=$(date +%s)
+        if [ "${{ inputs.mode }}" = "release-check" ]; then
+          # Store requirements first, so the verdict has them even when the build fails.
+          REL="$RUNNER_TEMP/jaglosky-release"
+          mkdir -p "$REL"
+          "$JAGLOSKY_ROOT/jaglosky" scan "$GITHUB_WORKSPACE" --resolve --out "$REL/state.json" > "$REL/report.md" || true
+          echo "release-dir=$REL" >> "$GITHUB_OUTPUT"
+          node -e 'const a = require(process.argv[1]).apps[0]; console.log(`has-android=${a.stack.platforms.android}\nhas-ios=${a.stack.platforms.ios}`)' "$REL/state.json" >> "$GITHUB_OUTPUT"
+          if [ -n "${{ inputs.binary-url }}" ]; then
+            bash "$GITHUB_ACTION_PATH/fetch-binary.sh" "${{ inputs.binary-url }}" "$RUNNER_TEMP/jaglosky-run"
+          else
+            "$JAGLOSKY_ROOT/jaglosky" verify "$GITHUB_WORKSPACE" --release
+          fi
+        elif [ "${{ inputs.mode }}" = "verify" ]; then
+          git fetch -q origin "${{ inputs.base }}" || true
+          BASE_REF="origin/${{ inputs.base }}"
+          git rev-parse -q --verify "$BASE_REF" > /dev/null || BASE_REF="${{ inputs.base }}"
+          "$JAGLOSKY_ROOT/jaglosky" verify "$GITHUB_WORKSPACE" --base "$BASE_REF" --android-variant "${{ inputs.android-variant }}"
+        else
+          "$JAGLOSKY_ROOT/jaglosky" agent run \
+            --repo "$GITHUB_WORKSPACE" \
+            --task "${{ inputs.task }}" \
+            --max-turns "${{ inputs.max-turns }}" \
+            --retries "${{ inputs.retries }}" \
+            --android-variant "${{ inputs.android-variant }}"
+        fi
+        echo "### Jaglosky (${{ inputs.mode }}): $(( ($(date +%s) - START) / 60 )) min" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Gradle facts cache (save)
+      if: always() && steps.fp.outputs.android != '' && steps.facts.outputs.cache-hit != 'true'
+      continue-on-error: true
+      uses: actions/cache/save@v4
+      with:
+        path: ~/.jaglosky-binaries/facts-android-*.json
+        key: jaglosky-facts-android-${{ steps.fp.outputs.android }}
+
+    - name: Binary cache (save)
+      if: always() && steps.run.outputs.new-binary-key != ''
+      continue-on-error: true
+      uses: actions/cache/save@v4
+      with:
+        path: ~/.jaglosky-binaries/android-*.apk
+        key: jaglosky-bin-${{ steps.run.outputs.new-binary-key }}
+
+    - name: Push branch and open PR
+      id: pr
+      if: inputs.mode == 'agent' && steps.run.outputs.outcome == 'green'
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PUSH_TOKEN: ${{ inputs.push-token }}
+      run: |
+        BRANCH="${{ steps.run.outputs.branch }}"
+        BODY="${{ steps.run.outputs.pr-body }}"
+        if [ -n "$PUSH_TOKEN" ]; then
+          # Empty extraheader drops the checkout's GITHUB_TOKEN header, so the push uses PUSH_TOKEN.
+          git -c http.https://github.com/.extraheader= push --force \
+            "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$BRANCH"
+        elif git diff --name-only "origin/${{ steps.run.outputs.base }}...$BRANCH" 2>/dev/null | grep -q '^\.github/workflows/'; then
+          echo "::error::The agent's change touches .github/workflows, and GITHUB_TOKEN cannot push workflow files. Add the JAGLOSKY_PUSH_TOKEN secret (fine-grained PAT or GitHub App token: Contents + Workflows write on this repo) and run again."
+          echo "### Jaglosky: needs JAGLOSKY_PUSH_TOKEN to push a workflow change" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+        else
+          git push --force origin "$BRANCH"
+        fi
+        TITLE="[Jaglosky] $(git log -1 --format=%s "$BRANCH" | sed 's/^chore(jaglosky): //')"
+        NUM="$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')"
+        if [ -n "$NUM" ]; then
+          gh pr edit "$NUM" --title "$TITLE" --body-file "$BODY"
+        else
+          gh pr create --base "${{ steps.run.outputs.base }}" --head "$BRANCH" --title "$TITLE" --body-file "$BODY"
+          NUM="$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')"
+        fi
+        echo "number=$NUM" >> "$GITHUB_OUTPUT"
+        echo "url=$(gh pr view "$NUM" --json url --jq .url)" >> "$GITHUB_OUTPUT"
+        echo "### Jaglosky: PR #$NUM (${{ steps.run.outputs.cost-usd }} USD)" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: PR for the verified branch
+      id: prlookup
+      if: inputs.mode == 'verify'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        NUM="$(gh pr list -R "$GITHUB_REPOSITORY" --head "$GITHUB_REF_NAME" --state open --json number --jq '.[0].number // empty')"
+        echo "number=$NUM" >> "$GITHUB_OUTPUT"
+        [ -n "$NUM" ] && echo "url=$(gh pr view "$NUM" -R "$GITHUB_REPOSITORY" --json url --jq .url)" >> "$GITHUB_OUTPUT" || true

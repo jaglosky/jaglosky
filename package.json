@@ -1,0 +1,31 @@
+{
+  "name": "jaglosky",
+  "version": "1.1.2",
+  "description": "Jaglosky — store-compliance radar and maintenance agent for mobile app fleets",
+  "license": "SEE LICENSE IN LICENSE.md",
+  "homepage": "https://github.com/jaglosky/jaglosky",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jaglosky/jaglosky.git"
+  },
+  "type": "module",
+  "bin": {
+    "jaglosky": "bin/jaglosky.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "bin",
+    "jaglosky",
+    "packages",
+    "templates",
+    "LICENSE.md",
+    "README.md"
+  ],
+  "jaglosky": {
+    "agentSdk": [
+      "@anthropic-ai/claude-agent-sdk@^0.3.319"
+    ]
+  }
+}

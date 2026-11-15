@@ -1,0 +1,53 @@
+name: Jaglosky → Slack
+description: Slack message about the run result (agent PR or verify run + build + emulator/simulator) or "needs a human"
+inputs:
+  webhook-url:
+    description: Slack Incoming Webhook (from repo secrets)
+    required: true
+  run-dir:
+    description: Directory with the run result (result.json from the agent, or verify.json from verify mode)
+    default: jaglosky-run
+  smoke-dir:
+    description: Directory with the Android smoke test result
+    default: jaglosky-smoke
+  ios-smoke-dir:
+    description: Directory with the iOS smoke test result
+    default: jaglosky-smoke-ios
+  branch:
+    description: Verified branch (verify mode)
+    default: ""
+  pr-url:
+    default: ""
+  app:
+    description: App name in the message
+    default: ""
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 24
+    - name: Install Jaglosky
+      shell: bash
+      run: |
+        bash "$GITHUB_ACTION_PATH/../setup-cli.sh"
+    - name: Send
+      shell: bash
+      env:
+        SLACK_WEBHOOK_URL: ${{ inputs.webhook-url }}
+      run: |
+        if [ ! -f "${{ inputs.run-dir }}/result.json" ] && [ ! -f "${{ inputs.run-dir }}/verify.json" ]; then
+          echo "No result.json / verify.json — the run did not finish; sending an alert without details."
+          TEXT="the run did not finish"; LOGS="run logs"
+          curl -fsS -X POST -H 'content-type: application/json' "$SLACK_WEBHOOK_URL" \
+            --data "{\"text\":\"🛑 Jaglosky (${{ inputs.app || github.repository }}): $TEXT — <$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID|$LOGS>\"}"
+          exit 0
+        fi
+        "$JAGLOSKY_ROOT/jaglosky" notify slack \
+          --run-dir "$GITHUB_WORKSPACE/${{ inputs.run-dir }}" \
+          --smoke-dir "$GITHUB_WORKSPACE/${{ inputs.smoke-dir }}" \
+          --ios-smoke-dir "$GITHUB_WORKSPACE/${{ inputs.ios-smoke-dir }}" \
+          ${{ inputs.branch != '' && format('--branch "{0}"', inputs.branch) || '' }} \
+          --app "${{ inputs.app || github.event.repository.name }}" \
+          --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+          ${{ inputs.pr-url != '' && format('--pr-url "{0}"', inputs.pr-url) || '' }}

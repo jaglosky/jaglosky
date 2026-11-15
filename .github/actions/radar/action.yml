@@ -1,0 +1,155 @@
+name: Jaglosky radar
+description: Repo scan (cron) → report in the run summary + Slack digest → (optional) autopilot dispatches the agent for "→ agent" findings
+inputs:
+  app-env:
+    description: (optional) the app's .env as KEY=value lines (secret JAGLOSKY_APP_ENV) — only EXPO_PUBLIC_* lines reach the build
+    default: ""
+  github-token:
+    required: true
+  webhook-url:
+    description: Slack Incoming Webhook (empty = no Slack; the report is in the run summary anyway)
+    default: ""
+  autopilot:
+    description: "true = for findings with the dispatch_agent action, run the Jaglosky workflow (mode=agent) if there is no open PR"
+    default: "false"
+  ios:
+    description: "Passed to agent runs dispatched by the autopilot"
+    default: "false"
+  workflow:
+    description: Name of the workflow that runs the agent
+    default: Jaglosky
+  asc-key-id:
+    description: App Store Connect API — Key ID (repo secret; empty = no Apple account monitoring)
+    default: ""
+  asc-issuer-id:
+    default: ""
+  asc-key-p8:
+    description: Contents of the .p8 file (App Manager role)
+    default: ""
+outputs:
+  state:
+    value: ${{ steps.scan.outputs.state }}
+  report-dir:
+    description: Human-readable report (PDF + HTML) of this app
+    value: ${{ steps.report.outputs.dir }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 24
+
+    - name: Install Jaglosky
+      shell: bash
+      run: |
+        echo "JAGLOSKY_BINARY_CACHE=$HOME/.jaglosky-binaries" >> "$GITHUB_ENV"
+        bash "$GITHUB_ACTION_PATH/../setup-cli.sh"
+
+    - name: App configuration (EXPO_PUBLIC_* from JAGLOSKY_APP_ENV)
+      if: inputs.app-env != ''
+      shell: bash
+      env:
+        APP_ENV: ${{ inputs.app-env }}
+      run: bash "$GITHUB_ACTION_PATH/../app-env.sh"
+
+    - name: App dependencies
+      shell: bash
+      run: bash "$GITHUB_ACTION_PATH/../install-deps.sh"
+    - name: Flutter SDK (Flutter apps only — resolves flutter.* Gradle values)
+      if: hashFiles('pubspec.yaml') != ''
+      uses: subosito/flutter-action@v2
+      with:
+        channel: stable
+        cache: true
+
+    - name: Native fingerprint
+      id: fp
+      shell: bash
+      run: '"$JAGLOSKY_ROOT/jaglosky" fingerprint "$GITHUB_WORKSPACE" > /dev/null || echo "android=" >> "$GITHUB_OUTPUT"'
+
+    - name: Gradle facts cache (restore)
+      id: facts
+      if: steps.fp.outputs.android != ''
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/.jaglosky-binaries/facts-android-*.json
+        key: jaglosky-facts-android-${{ steps.fp.outputs.android }}
+
+    - name: Scan
+      id: scan
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}   # read merged Jaglosky PRs for the "done in the last 30 days" summary
+      run: |
+        STATE="$RUNNER_TEMP/jaglosky-state.json"
+        "$JAGLOSKY_ROOT/jaglosky" scan "$GITHUB_WORKSPACE" --resolve --out "$STATE" > "$RUNNER_TEMP/jaglosky-report.md"
+        cat "$RUNNER_TEMP/jaglosky-report.md" >> "$GITHUB_STEP_SUMMARY"
+        echo "state=$STATE" >> "$GITHUB_OUTPUT"
+
+    - name: Report (PDF, plain English)
+      id: report
+      continue-on-error: true
+      shell: bash
+      run: |
+        "$JAGLOSKY_ROOT/jaglosky" report --state "${{ steps.scan.outputs.state }}" --out "$RUNNER_TEMP/jaglosky-report" > /dev/null
+        echo "dir=$RUNNER_TEMP/jaglosky-report" >> "$GITHUB_OUTPUT"
+    - name: Dependency vulnerabilities (OSV.dev, bundle contents)
+      continue-on-error: true
+      shell: bash
+      env:
+        NODE_OPTIONS: --max-old-space-size=4096
+      run: '"$JAGLOSKY_ROOT/jaglosky" vulns "$GITHUB_WORKSPACE" --bundle --state "${{ steps.scan.outputs.state }}" >> "$GITHUB_STEP_SUMMARY"'
+
+    - name: Apple account (certificates, profiles, agreements, membership)
+      if: inputs.asc-key-id != ''
+      continue-on-error: true
+      shell: bash
+      env:
+        JAGLOSKY_ASC_KEY_ID: ${{ inputs.asc-key-id }}
+        JAGLOSKY_ASC_ISSUER_ID: ${{ inputs.asc-issuer-id }}
+        JAGLOSKY_ASC_KEY_P8: ${{ inputs.asc-key-p8 }}
+      run: '"$JAGLOSKY_ROOT/jaglosky" accounts check "$GITHUB_WORKSPACE" --state "${{ steps.scan.outputs.state }}" >> "$GITHUB_STEP_SUMMARY"'
+
+    - name: Gradle facts cache (save)
+      if: steps.fp.outputs.android != '' && steps.facts.outputs.cache-hit != 'true'
+      continue-on-error: true
+      uses: actions/cache/save@v4
+      with:
+        path: ~/.jaglosky-binaries/facts-android-*.json
+        key: jaglosky-facts-android-${{ steps.fp.outputs.android }}
+
+    - name: Slack digest
+      if: inputs.webhook-url != ''
+      continue-on-error: true
+      shell: bash
+      env:
+        SLACK_WEBHOOK_URL: ${{ inputs.webhook-url }}
+      run: '"$JAGLOSKY_ROOT/jaglosky" notify slack --state "${{ steps.scan.outputs.state }}"'
+
+    - name: Autopilot (L1) — agent for "→ agent" findings
+      if: inputs.autopilot == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        node -e '
+          const s = require(process.argv[1]);
+          const seen = new Set();
+          for (const a of s.apps) for (const f of a.findings)
+            if (f.next_action === "dispatch_agent" && f.fix_task && !seen.has(f.fix_task)) {
+              seen.add(f.fix_task); console.log(`${f.fix_task} ${f.rule_id}`);
+            }' "${{ steps.scan.outputs.state }}" > "$RUNNER_TEMP/dispatch.txt"
+        {
+          echo "### Autopilot"
+          if [ ! -s "$RUNNER_TEMP/dispatch.txt" ]; then echo "Nothing for the agent to do."; fi
+        } >> "$GITHUB_STEP_SUMMARY"
+        while read -r TASK RULE; do
+          [ -z "$TASK" ] && continue
+          OPEN="$(gh pr list -R "$GITHUB_REPOSITORY" --head "jaglosky/$RULE" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$OPEN" ]; then
+            echo "- \`$RULE\`: PR #$OPEN already open — waiting for review" >> "$GITHUB_STEP_SUMMARY"
+          else
+            gh workflow run "${{ inputs.workflow }}" -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" -f mode=agent -f task="$TASK" -f ios="${{ inputs.ios }}"
+            echo "- \`$RULE\`: agent dispatched (\`$TASK\`)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+        done < "$RUNNER_TEMP/dispatch.txt"

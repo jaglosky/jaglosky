@@ -1,0 +1,63 @@
+# Jaglosky release check — a pre-release sanity check in the cloud.
+# Store requirements + a RELEASE build (R8/ProGuard, signed with a throwaway CI key — your keystore is never
+# needed) or your own APK/AAB + Android emulator and iOS simulator smoke tests with screenshots
+# → one go / no-go verdict in the run summary and on Slack.
+# The jobs live in the Jaglosky distribution (https://github.com/jaglosky/jaglosky), pinned to a major version.
+#
+# Run it: Actions → "Jaglosky release check" → Run workflow (any branch), or push a tag `v*`,
+# or call it from your release workflow as a gate:
+#   jobs:
+#     release-check:
+#       uses: ./.github/workflows/jaglosky-release-check.yml
+#       secrets: inherit
+#     release:
+#       needs: release-check      # runs only on GO / GO with warnings
+name: Jaglosky release check
+
+on:
+  workflow_dispatch:
+    inputs:
+      ios:
+        description: "Check iOS on a macOS runner"
+        type: boolean
+        default: true
+      binary-url:
+        description: "(optional) Test this APK/AAB instead of building one — a direct https link (e.g. EAS or CI artifact)"
+        default: ""
+      xcode:
+        description: "(optional) Xcode for the iOS build, e.g. 16.4 for an app that does not build on Xcode 26 yet (default: newest)"
+        default: ""
+  push:
+    tags: ["v*"]
+  workflow_call:
+    inputs:
+      ios:
+        type: boolean
+        default: true
+      binary-url:
+        type: string
+        default: ""
+      xcode:
+        type: string
+        default: ""
+
+permissions:
+  contents: write    # screenshots on the jaglosky-artifacts branch
+  statuses: write    # jaglosky/smoke-* status on the checked commit
+  actions: read
+
+jobs:
+  release-check:
+    uses: jaglosky/jaglosky/.github/workflows/release-check.yml@v1
+    with:
+      ios: ${{ inputs.ios || false }}   # tag pushes always include iOS
+      binary-url: ${{ inputs.binary-url || '' }}
+      xcode: ${{ inputs.xcode || '' }}
+    secrets:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      JAGLOSKY_APP_ENV: ${{ secrets.JAGLOSKY_APP_ENV }}                   # the app's EXPO_PUBLIC_* config for CI builds
+      JAGLOSKY_LICENSE_KEY: ${{ secrets.JAGLOSKY_LICENSE_KEY }}
+      JAGLOSKY_ASC_KEY_ID: ${{ secrets.JAGLOSKY_ASC_KEY_ID }}             # optional: compare the version with the stores
+      JAGLOSKY_ASC_ISSUER_ID: ${{ secrets.JAGLOSKY_ASC_ISSUER_ID }}
+      JAGLOSKY_ASC_KEY_P8: ${{ secrets.JAGLOSKY_ASC_KEY_P8 }}
+      JAGLOSKY_PLAY_SA_JSON: ${{ secrets.JAGLOSKY_PLAY_SA_JSON }}

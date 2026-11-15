@@ -1,0 +1,317 @@
+# Jaglosky — the jobs behind a client's `Jaglosky` workflow (radar, agent, verification, notifications).
+# Called from the short workflow file in the app repo (templates/github/jaglosky.yml):
+#   jobs:
+#     jaglosky:
+#       uses: jaglosky/jaglosky/.github/workflows/jaglosky.yml@v1
+# Everything runs on the caller's runners with the caller's secrets; `github.*` is the caller's context
+# (its event, ref and token), so the triggers — schedule, issues, manual run — stay in the caller's file.
+name: Jaglosky
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "agent | verify | scan (empty on schedule and issue events)"
+        type: string
+        default: ""
+      task:
+        description: Agent task (agent mode)
+        type: string
+        default: target-sdk-36
+      base:
+        description: Base branch for verify mode (empty = the repository's default branch)
+        type: string
+        default: ""
+      seed-run-id:
+        description: "(optional) ID of a run whose APK seeds the binary cache"
+        type: string
+        default: ""
+      android-package:
+        description: "The app's applicationId for the smoke test (empty = read from the APK)"
+        type: string
+        default: ""
+      app-name:
+        description: "App name in notifications (empty = repo name)"
+        type: string
+        default: ""
+      ios:
+        description: Verify iOS on a macOS runner
+        type: boolean
+        default: false
+      autopilot:
+        description: "scan mode: also dispatch the agent for every finding it can fix"
+        type: boolean
+        default: false
+    secrets:
+      ANTHROPIC_API_KEY:
+        description: "the agent's model key (fix pull requests); without it only the radar and verification run"
+        required: false
+      SLACK_WEBHOOK_URL:
+        description: "Slack incoming webhook for digests, PR and verdict messages"
+        required: false
+      JAGLOSKY_APP_ID:
+        description: "the client's Jaglosky GitHub App (from `jaglosky init`); absent → github.token"
+        required: false
+      JAGLOSKY_APP_PRIVATE_KEY:
+        description: "private key of that app"
+        required: false
+      JAGLOSKY_APP_ENV:
+        description: "the app's EXPO_PUBLIC_* configuration for CI builds (one KEY=value per line)"
+        required: false
+      JAGLOSKY_PUSH_TOKEN:
+        description: "optional PAT for changes under .github/workflows when no GitHub App is used"
+        required: false
+      JAGLOSKY_LICENSE_KEY:
+        description: "rules feed and usage metering"
+        required: false
+      JAGLOSKY_ASC_KEY_ID:
+        description: "App Store Connect API key id (account checks, version vs store)"
+        required: false
+      JAGLOSKY_ASC_ISSUER_ID:
+        description: "App Store Connect issuer id"
+        required: false
+      JAGLOSKY_ASC_KEY_P8:
+        description: "App Store Connect private key"
+        required: false
+
+env:
+  JAGLOSKY_LICENSE_KEY: ${{ secrets.JAGLOSKY_LICENSE_KEY }}   # rules feed + usage metering (from `jaglosky init`)
+  JAGLOSKY_API: ${{ vars.JAGLOSKY_API }}                      # empty = no Jaglosky service: bundled rules, no metering
+
+concurrency:
+  group: jaglosky-${{ github.event_name == 'issues' && format('command-{0}', github.event.issue.number) || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Slack buttons open a prefilled issue "Jaglosky: scan | fix all | fix <task>"; submitting it runs the command here.
+  # Only the repo's owners, members and collaborators; the issue gets the run link and is closed.
+  command:
+    if: github.event_name == 'issues' && startsWith(github.event.issue.title, 'Jaglosky:') && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Run the command
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}   # no checkout here — gh must not look for a git repo
+          TITLE: ${{ github.event.issue.title }}
+          ISSUE: ${{ github.event.issue.number }}
+          AUTHOR: ${{ github.event.issue.user.login }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          CMD="$(printf '%s' "$TITLE" | sed -E 's/^Jaglosky:[[:space:]]*//' | tr 'A-Z' 'a-z' | sed -E 's/[[:space:]]+$//')"
+          case "$CMD" in
+            scan)      ARGS="-f mode=scan";                  WHAT="full scan (radar + report)" ;;
+            "fix all") ARGS="-f mode=scan -f autopilot=true"; WHAT="scan, then the agent for every fixable finding" ;;
+            fix\ *)
+              TASK="${CMD#fix }"
+              if ! printf '%s' "$TASK" | grep -Eq '^[a-z0-9-]{2,40}$'; then
+                gh issue comment "$ISSUE" --body "Unknown task \`$TASK\`." && gh issue close "$ISSUE" --reason "not planned"; exit 0
+              fi
+              ARGS="-f mode=agent -f task=$TASK"; WHAT="the agent: \`$TASK\` (opens a pull request)" ;;
+            *) gh issue comment "$ISSUE" --body "Unknown command \`$CMD\` — use \`scan\`, \`fix all\` or \`fix <task>\`." && gh issue close "$ISSUE" --reason "not planned"; exit 0 ;;
+          esac
+          gh workflow run "${{ github.workflow }}" -R "$GITHUB_REPOSITORY" --ref "$BRANCH" $ARGS
+          sleep 6
+          RUN="$(gh run list -R "$GITHUB_REPOSITORY" --workflow "${{ github.workflow }}" --event workflow_dispatch --limit 1 --json url --jq '.[0].url')"
+          gh issue comment "$ISSUE" --body "▶️ Started for @$AUTHOR: $WHAT — $RUN. The result also goes to Slack."
+          gh issue close "$ISSUE" --reason completed
+
+  radar:
+    if: github.event_name == 'schedule' || inputs.mode == 'scan'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      JAGLOSKY_APP_ID: ${{ secrets.JAGLOSKY_APP_ID }}
+    steps:
+      - id: app-token   # the client's Jaglosky GitHub App (from `jaglosky init`); absent → github.token
+        if: env.JAGLOSKY_APP_ID != ''
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ env.JAGLOSKY_APP_ID }}
+          private-key: ${{ secrets.JAGLOSKY_APP_PRIVATE_KEY }}
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+      - id: radar
+        uses: jaglosky/jaglosky/.github/actions/radar@v1
+        with:
+          app-env: ${{ secrets.JAGLOSKY_APP_ENV }}   # optional: the app's EXPO_PUBLIC_* config for CI builds
+          github-token: ${{ steps.app-token.outputs.token || github.token }}
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          autopilot: ${{ inputs.autopilot && 'true' || vars.JAGLOSKY_AUTOPILOT || 'false' }}
+          ios: ${{ vars.JAGLOSKY_IOS || 'false' }}
+          asc-key-id: ${{ secrets.JAGLOSKY_ASC_KEY_ID }}
+          asc-issuer-id: ${{ secrets.JAGLOSKY_ASC_ISSUER_ID }}
+          asc-key-p8: ${{ secrets.JAGLOSKY_ASC_KEY_P8 }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jaglosky-state
+          path: ${{ steps.radar.outputs.state || 'jaglosky-no-state' }}
+          if-no-files-found: ignore
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jaglosky-report
+          path: ${{ steps.radar.outputs.report-dir || 'jaglosky-no-report' }}
+          if-no-files-found: ignore
+          retention-days: 90
+
+  agent:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode != 'scan'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    outputs:
+      outcome: ${{ steps.agent.outputs.outcome }}
+      pr-number: ${{ steps.agent.outputs.pr-number }}
+      pr-url: ${{ steps.agent.outputs.pr-url }}
+      branch: ${{ steps.agent.outputs.branch }}
+      ios-strategy: ${{ steps.agent.outputs.ios-strategy }}
+      apk: ${{ steps.agent.outputs.apk }}
+    env:
+      JAGLOSKY_APP_ID: ${{ secrets.JAGLOSKY_APP_ID }}
+    steps:
+      - id: app-token   # the client's Jaglosky GitHub App (from `jaglosky init`); absent → github.token
+        if: env.JAGLOSKY_APP_ID != ''
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ env.JAGLOSKY_APP_ID }}
+          private-key: ${{ secrets.JAGLOSKY_APP_PRIVATE_KEY }}
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # compare fingerprints with the base (verify mode)
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4   # Gradle cache (dependencies + build cache)
+      - id: agent
+        uses: jaglosky/jaglosky/.github/actions/agent@v1
+        with:
+          app-env: ${{ secrets.JAGLOSKY_APP_ENV }}
+          mode: ${{ inputs.mode }}
+          base: ${{ inputs.base || github.event.repository.default_branch }}
+          seed-run-id: ${{ inputs.seed-run-id }}
+          task: ${{ inputs.task }}
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # The app token can push workflow files and open PRs (no repo setting needed); without it:
+          # JAGLOSKY_PUSH_TOKEN (optional PAT) for changes under .github/workflows, github.token for the rest.
+          push-token: ${{ steps.app-token.outputs.token || secrets.JAGLOSKY_PUSH_TOKEN }}
+          ios: ${{ inputs.ios }}
+          github-token: ${{ steps.app-token.outputs.token || github.token }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jaglosky-run
+          path: ${{ steps.agent.outputs.run-dir || 'jaglosky-no-run' }}
+          if-no-files-found: ignore
+          retention-days: 14
+
+  smoke:
+    needs: agent
+    if: needs.agent.outputs.outcome == 'green' && needs.agent.outputs.apk != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: jaglosky-run
+          path: jaglosky-run
+      - uses: jaglosky/jaglosky/.github/actions/smoke-android@v1
+        with:
+          apk: jaglosky-run   # the APK from the agent job (release for Expo/RN, debug for native/Flutter)
+          package: ${{ inputs.android-package }}
+          pr-number: ${{ needs.agent.outputs.pr-number }}
+          github-token: ${{ github.token }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jaglosky-smoke
+          path: jaglosky-smoke
+          if-no-files-found: ignore
+          retention-days: 14
+
+  ios:
+    needs: agent
+    if: needs.agent.outputs.outcome == 'green' && (needs.agent.outputs.ios-strategy == 'build' || needs.agent.outputs.ios-strategy == 'repack')
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.agent.outputs.branch || github.ref }}
+      - uses: jaglosky/jaglosky/.github/actions/smoke-ios@v1
+        with:
+          app-env: ${{ secrets.JAGLOSKY_APP_ENV }}
+          pr-number: ${{ needs.agent.outputs.pr-number }}
+          github-token: ${{ github.token }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jaglosky-smoke-ios
+          path: jaglosky-smoke-ios
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # GitHub sometimes cannot provide an Apple-silicon runner: the job waits ~15 min and ends as
+  # cancelled ("not acquired by Runner … after multiple attempts"). Same job on the Intel image
+  # (macOS 26, Xcode 26). Skipped when a person cancelled the run.
+  ios-intel:
+    needs: [agent, ios]
+    if: ${{ !cancelled() && needs.ios.result == 'cancelled' }}
+    runs-on: macos-26-intel
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.agent.outputs.branch || github.ref }}
+      - uses: jaglosky/jaglosky/.github/actions/smoke-ios@v1
+        with:
+          app-env: ${{ secrets.JAGLOSKY_APP_ENV }}
+          pr-number: ${{ needs.agent.outputs.pr-number }}
+          github-token: ${{ github.token }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jaglosky-smoke-ios
+          path: jaglosky-smoke-ios
+          if-no-files-found: ignore
+          retention-days: 14
+
+  notify:
+    needs: [agent, smoke, ios, ios-intel]
+    if: always() && needs.agent.result != 'cancelled' && needs.agent.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    steps:
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: jaglosky-run
+          path: jaglosky-run
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: jaglosky-smoke
+          path: jaglosky-smoke
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: jaglosky-smoke-ios
+          path: jaglosky-smoke-ios
+      - if: env.SLACK_WEBHOOK_URL != ''
+        continue-on-error: true
+        uses: jaglosky/jaglosky/.github/actions/notify-slack@v1
+        with:
+          webhook-url: ${{ env.SLACK_WEBHOOK_URL }}
+          pr-url: ${{ needs.agent.outputs.pr-url }}
+          branch: ${{ inputs.mode == 'verify' && github.ref_name || '' }}
+          app: ${{ inputs.app-name }}
